@@ -9,9 +9,11 @@
 рождения" відповідає формату ДД.ММ.РРРР — все інше ігнорується автоматично,
 тому структура з заголовками підрозділів НЕ заважає боту.
 
-HR редагує ТІЛЬКИ колонки A-C. Жодної видимої "галочки" чи позначки бот
-у таблицю не додає — весь службовий стан прихований у клітинках рядка 1
-(колонки D-H), і на них можна взагалі не звертати уваги.
+HR редагує ТІЛЬКИ основний аркуш, колонки A-C. Весь службовий стан бота
+(кому відправлено, історія шаблонів тощо) живе на ОКРЕМОМУ, повністю
+відокремленому аркуші (config.BOT_STATE_SHEET_TAB) — HR його ніколи не
+бачить і не редагує, тому навіть повне очищення основного аркуша (A-Z)
+фізично не може зачепити стан бота.
 """
 import re
 import time
@@ -52,11 +54,66 @@ def _retry(fn, *args, retries=3, base_delay=5, **kwargs):
     raise last_err
 
 
-def get_worksheet():
+def get_spreadsheet():
     gc = _retry(_client)
-    sh = _retry(gc.open_by_key, config.GOOGLE_SHEET_ID)
-    ws = _retry(sh.worksheet, config.GOOGLE_SHEET_TAB)
-    return ws
+    return _retry(gc.open_by_key, config.GOOGLE_SHEET_ID)
+
+
+def get_worksheet():
+    """Основний аркуш з даними працівників (той, який редагує HR)."""
+    sh = get_spreadsheet()
+    return _retry(sh.worksheet, config.GOOGLE_SHEET_TAB)
+
+
+def get_state_worksheet():
+    """Окремий СЛУЖБОВИЙ аркуш, де бот зберігає весь свій технічний стан
+    (кому відправлено, кого бачили, історію шаблонів/вступів тощо). HR
+    його НІКОЛИ не редагує — навіть повне очищення основного аркуша з
+    працівниками (Крок "виділити A-Z і вставити наново") фізично не може
+    зачепити цей окремий аркуш, бо це геть інша вкладка.
+
+    Якщо аркуша ще не існує (перший запуск бота) — створюється сам,
+    автоматично, з поясювальним заголовком. Жодних ручних дій від вас
+    не потрібно."""
+    sh = get_spreadsheet()
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            return sh.worksheet(config.BOT_STATE_SHEET_TAB)
+        except gspread.exceptions.WorksheetNotFound:
+            logger.info("Службового аркуша '%s' ще немає — створюю.", config.BOT_STATE_SHEET_TAB)
+            new_ws = sh.add_worksheet(title=config.BOT_STATE_SHEET_TAB, rows=20, cols=10)
+            _init_state_sheet(new_ws)
+            return new_ws
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning(
+                "Помилка відкриття службового аркуша (спроба %s/3): %s", attempt, e
+            )
+            time.sleep(5 * attempt)
+    raise last_err
+
+
+def _init_state_sheet(ws):
+    """Заповнює новостворений службовий аркуш зрозумілими заголовками
+    (для людини, яка випадково туди зазирне) — дані самого стану
+    зберігаються рядком нижче (config.STATE_ROW), щоб рядок 1 міг
+    містити людські підписи."""
+    headers = [
+        "Дата очищення", "Дата ранкового зведення", "Дата 'усіх привітано'",
+        "Кому відправлено сьогодні (JSON)", "Дата попередження про колізію",
+        "Кого бачили сьогодні (JSON)", "Історія шаблонів за 7 днів (JSON)",
+        "Історія вступів за 31 день (JSON)",
+    ]
+    _retry(ws.update, "A1:H1", [headers])
+    _retry(
+        ws.update, "A3",
+        [["⚠️ Це службовий аркуш бота привітань з Днем народження. "
+          "Будь ласка, НЕ редагуйте і не видаляйте його вміст — тут "
+          "зберігається технічний стан бота (кому вже відправлено "
+          "привітання, історія використаних шаблонів тощо). Дані "
+          "працівників редагуються на основному аркуші."]]
+    )
 
 
 def read_rows(ws):
@@ -84,9 +141,17 @@ def parse_location_line(line: str) -> tuple:
 
 
 def get_today_birthdays(ws, sent_keys: set, today: datetime = None):
-    """Повертає список іменинників на сьогодні:
-    [{"row": <номер рядка>, "name": str, "date_str": str, "section": str,
-      "city": str, "key": str, "sent": bool}, ...]
+    """Повертає (greetable, duplicates, excluded_region):
+    - greetable: список іменинників на сьогодні, яких бот МАЄ привітати
+      [{"row": <номер рядка>, "name": str, "date_str": str, "section": str,
+        "city": str, "city_type": str, "key": str, "sent": bool}, ...]
+    - duplicates: колізії ключів серед greetable (див. нижче)
+    - excluded_region: іменинники, яких бот СВІДОМО НЕ вітає, бо їхня
+      локація визначена як "регіон" без конкретного магазину (наприклад
+      адміністративний персонал "Львівський регіон") — таких людей
+      вітають окремо безпосередньо керівники, тому автоматична розсилка
+      про них узагалі "не знає" (не рахує, не логує, не надсилає).
+
     Порівняння дати йде тільки по дню і місяцю (рік ігнорується).
 
     "today" — момент, який вважати "сьогодні". Якщо не передано —
@@ -99,10 +164,9 @@ def get_today_birthdays(ws, sent_keys: set, today: datetime = None):
 
     ВАЖЛИВО: "sent" визначається за ключем "Ім'я + Дата народження +
     Підрозділ" (key), яка звіряється зі списком sent_keys — незалежним
-    від позиції в таблиці станом, що зберігається в службовій клітинці
-    (див. get_sent_keys/add_sent_key нижче). У таблиці НЕМАЄ жодної
-    видимої колонки-позначки — весь стан прихований у службових клітинках
-    рядка 1, HR бачить і редагує тільки колонки A-C.
+    від позиції в таблиці станом, що зберігається на ОКРЕМОМУ службовому
+    аркуші (див. get_sent_keys/add_sent_key нижче). HR бачить і редагує
+    тільки основний аркуш, колонки A-C.
 
     Підрозділ береться з найближчого вище рядка-заголовку (рядки типу
     "Адміністрація", "Львівський регіон" тощо, де немає валідної дати) —
@@ -198,9 +262,19 @@ def get_today_birthdays(ws, sent_keys: set, today: datetime = None):
     # тезок з однаковою датою народження в одному підрозділі) — це
     # позначаємо окремо, щоб бот не "проковтнув" когось мовчки, а
     # bot_logic зміг попередити про це в логах.
+    #
+    # ВАЖЛИВО: людей, чия локація визначена як "region" (тобто немає
+    # конкретного магазину — лише загальний регіон, наприклад
+    # "Львівський регіон", як у адміністративного персоналу) —
+    # ПОВНІСТЮ виключаємо зі списку. Такий персонал вітають окремо,
+    # безпосередньо керівники, тому автоматичний бот про них узагалі
+    # "не знає" — не рахує їх у зведенні, не логує, не надсилає нічого.
+    greetable = [p for p in result if p["city_type"] != "region"]
+    excluded_region = [p for p in result if p["city_type"] == "region"]
+
     seen = {}
     duplicates = []
-    for person in result:
+    for person in greetable:
         if person["key"] in seen:
             duplicates.append((seen[person["key"]], person))
         else:
@@ -208,7 +282,7 @@ def get_today_birthdays(ws, sent_keys: set, today: datetime = None):
     if duplicates:
         logger.warning("Знайдено %s колізій ключів серед сьогоднішніх іменинників", len(duplicates))
 
-    return result, duplicates
+    return greetable, duplicates, excluded_region
 
 
 
@@ -224,27 +298,28 @@ def make_person_key(name: str, date_str: str, section: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Службовий стан (замінює локальний state.json, бо процес може будь-коли
-# перезапуститись/переспати — жодної спільної пам'яті між циклами немає,
-# тому стан зберігаємо прямо в таблиці, у службових клітинках D1/E1/F1/G1/H1.
-# Це ЄДИНЕ місце в таблиці, куди пише бот — жодних видимих колонок чи
-# позначок для HR немає.
+# Службовий стан. З версії з окремим аркушем — весь цей стан живе НЕ на
+# основному аркуші з працівниками, а на окремому службовому аркуші
+# (config.BOT_STATE_SHEET_TAB), недосяжному для HR. Дані зберігаються в
+# рядку config.STATE_ROW (рядок 1 того аркуша лишається під людські
+# підписи-заголовки, див. _init_state_sheet).
 # ---------------------------------------------------------------------------
 def get_state_cell(ws, col: int) -> str:
     try:
-        return _retry(ws.cell, 1, col).value or ""
+        return _retry(ws.cell, config.STATE_ROW, col).value or ""
     except Exception:  # noqa: BLE001
         return ""
 
 
 def set_state_cell(ws, col: int, value: str):
-    _retry(ws.update_cell, 1, col, value)
+    _retry(ws.update_cell, config.STATE_ROW, col, value)
 
 
 def get_sent_keys(ws) -> set:
     """Список тих, кому вже відправлено СЬОГОДНІ — за ключем
     Ім'я+Дата+Підрозділ, а не за номером рядка. Зберігається в службовій
-    клітинці (G1) у форматі JSON (а не через розділові символи типу ';' —
+    клітинці службового аркуша у форматі JSON (а не через розділові
+    символи типу ';' —
     бо ім'я чи назва підрозділу теоретично можуть містити такий символ, і
     "наївне" розділення могло б розірвати ключ навпіл і зіпсувати стан)."""
     raw = get_state_cell(ws, config.STATE_CELL_SENT_KEYS)
@@ -292,15 +367,15 @@ def clear_seen_keys(ws):
 
 
 # ---------------------------------------------------------------------------
-# Історія використаних шаблонів привітань (щоб жодні два привітання за
-# останні 7 днів не повторювались — навіть для різних людей).
-# Зберігається як список записів [{"date": "YYYY-MM-DD", "idx": N}, ...],
-# де idx — номер шаблону в списку TEMPLATES (templates.py). Записи
-# старші за TEMPLATE_HISTORY_DAYS автоматично відсіюються при кожному
-# читанні, тому клітинка сама "чиститься" і не росте нескінченно.
+# Спільна логіка "історії використаного" — застосовується і для шаблонів
+# привітань (не повторювати за тиждень), і для вступних фраз (не
+# повторювати за місяць). Зберігається як список записів
+# [{"date": "YYYY-MM-DD", "idx": N}, ...] у вказаній службовій клітинці.
+# Записи старші за задану кількість днів автоматично відсіюються при
+# кожному читанні, тому клітинка сама "чиститься" і не росте нескінченно.
 # ---------------------------------------------------------------------------
-def get_template_history(ws) -> list:
-    raw = get_state_cell(ws, config.STATE_CELL_TEMPLATE_HISTORY)
+def _get_index_history(ws, state_cell: int, history_days: int) -> list:
+    raw = get_state_cell(ws, state_cell)
     if not raw:
         return []
     try:
@@ -308,7 +383,7 @@ def get_template_history(ws) -> list:
     except (json.JSONDecodeError, TypeError):
         return []
 
-    cutoff = datetime.now() - timedelta(days=config.TEMPLATE_HISTORY_DAYS)
+    cutoff = datetime.now() - timedelta(days=history_days)
     fresh = []
     for entry in entries:
         try:
@@ -320,15 +395,21 @@ def get_template_history(ws) -> list:
     return fresh
 
 
+def _add_index_history_entry(ws, state_cell: int, history_days: int, date_str: str, idx: int):
+    entries = _get_index_history(ws, state_cell, history_days)  # вже відфільтровані свіжі
+    entries.append({"date": date_str, "idx": idx})
+    set_state_cell(ws, state_cell, json.dumps(entries, ensure_ascii=False))
+
+
+# --- Шаблони привітань (templates.py) — не повторювати за 7 днів ---
+def get_template_history(ws) -> list:
+    return _get_index_history(ws, config.STATE_CELL_TEMPLATE_HISTORY, config.TEMPLATE_HISTORY_DAYS)
+
+
 def add_template_history_entry(ws, date_str: str, template_idx: int):
-    """Додає запис про використаний шаблон і одразу відсіює застарілі
-    (старші за TEMPLATE_HISTORY_DAYS) — так клітинка сама не росте
-    нескінченно."""
-    entries = get_template_history(ws)  # вже відфільтровані свіжі
-    entries.append({"date": date_str, "idx": template_idx})
-    set_state_cell(
-        ws, config.STATE_CELL_TEMPLATE_HISTORY,
-        json.dumps(entries, ensure_ascii=False)
+    _add_index_history_entry(
+        ws, config.STATE_CELL_TEMPLATE_HISTORY, config.TEMPLATE_HISTORY_DAYS,
+        date_str, template_idx
     )
 
 
@@ -337,3 +418,37 @@ def get_recently_used_template_indices(ws) -> set:
     TEMPLATE_HISTORY_DAYS днів (включно з сьогодні) — саме цю множину
     треба виключити при виборі наступного шаблону."""
     return {entry["idx"] for entry in get_template_history(ws)}
+
+
+# --- Вступні фрази (тільки для першого привітання за день) — не
+#     повторювати протягом 31 дня ---
+def get_intro_history(ws) -> list:
+    return _get_index_history(ws, config.STATE_CELL_INTRO_HISTORY, config.INTRO_HISTORY_DAYS)
+
+
+def add_intro_history_entry(ws, date_str: str, intro_idx: int):
+    _add_index_history_entry(
+        ws, config.STATE_CELL_INTRO_HISTORY, config.INTRO_HISTORY_DAYS,
+        date_str, intro_idx
+    )
+
+def _set_index_history(ws, state_cell: int, entries: list):
+    """Прямий перезапис списку записів історії (використовується для
+    "лікування" клітинки, якщо її стерли, а в пам'яті процесу є свіжіші
+    дані — див. bot_logic.py)."""
+    set_state_cell(ws, state_cell, json.dumps(entries, ensure_ascii=False))
+
+
+def set_template_history(ws, entries: list):
+    _set_index_history(ws, config.STATE_CELL_TEMPLATE_HISTORY, entries)
+
+
+def set_intro_history(ws, entries: list):
+    _set_index_history(ws, config.STATE_CELL_INTRO_HISTORY, entries)
+
+
+def get_recently_used_intro_indices(ws) -> set:
+    """Множина номерів вступних фраз, використаних за останні
+    INTRO_HISTORY_DAYS днів (включно з сьогодні)."""
+    return {entry["idx"] for entry in get_intro_history(ws)}
+

@@ -34,7 +34,7 @@
 import logging
 import random
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import config
@@ -45,22 +45,43 @@ from templates import TEMPLATES
 logger = logging.getLogger("birthday_bot")
 
 # Пам'ять процесу (НЕ Google Таблиці). Це додатковий запобіжник на
-# випадок, якщо хтось випадково зачепить службові клітинки D1:H1 у
-# таблиці (наприклад, HR виділив ВЕСЬ аркуш і вставив дані наново, не
-# лишивши цих колонок недоторканими). Без цього запобіжника бот міг би:
+# випадок, якщо хтось випадково зачепить службові клітинки D1:K1 у
+# таблиці (наприклад, HR виділив ВЕСЬ аркуш, від A до Z, і вставив дані
+# наново, не лишивши цих колонок недоторканими). Без цього запобіжника
+# бот міг би:
 #   а) вирішити, що почався новий день, і почати вітати вже привітаних
 #      людей повторно;
-#   б) навіть якщо не почне "новий день" повторно — сам список "кому
-#      вже відправлено" міг фізично зникнути з таблиці, і бот про це не
-#      дізнається, якщо не звіряється з власною пам'яттю.
-# Тому бот дублює список "кому відправлено сьогодні" і в пам'яті
-# процесу, і використовує це, щоб "вилікувати" таблицю, якщо там
-# частина записів раптом зникла. Оскільки процес на Render живе
-# годинами/днями без перезапуску — це надійний додатковий захист (хоч
-# і не стовідсотковий: якщо збіг стирання з перезапуском процесу
-# станеться одночасно, захист не спрацює).
+#   б) "забути", кому вже відправлено сьогодні, і продублювати;
+#   в) "забути" історію використаних шаблонів/вступних фраз за останні
+#      7/31 днів — і випадково повторити те, що вже надсилалось.
+# Тому бот дублює ВСІ ці дані і в пам'яті процесу, і використовує це,
+# щоб "вилікувати" таблицю, якщо там щось раптом зникло. Оскільки процес
+# на Render живе годинами/днями без перезапуску — це надійний додатковий
+# захист (хоч і не стовідсотковий: якщо збіг стирання з перезапуском
+# процесу станеться одночасно, захист не спрацює — саме тому й існує
+# базовий захист "genuinely_new_day" нижче, який працює навіть тоді).
 _last_seen_day = None
 _sent_keys_memory = set()
+_seen_keys_memory = set()
+_template_history_memory = set()  # множина (date_str, idx)
+_intro_history_memory = set()     # множина (date_str, idx)
+
+
+def _prune_history_pairs(pairs: set, history_days: int, today_naive: datetime) -> set:
+    """Прибирає з множини (date_str, idx) записи, старші за history_days
+    відносно today_naive. Використовується і для пам'яті процесу, і для
+    об'єднання з таблицею — щоб застарілі записи не "воскресали" назавжди
+    через пам'ять."""
+    cutoff = today_naive - timedelta(days=history_days)
+    pruned = set()
+    for date_str, idx in pairs:
+        try:
+            entry_date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if entry_date >= cutoff:
+            pruned.add((date_str, idx))
+    return pruned
 
 
 def get_first_name(full_name: str) -> str:
@@ -127,6 +148,47 @@ CONNECTOR_PHRASES = {
 # щоб бот не "закінчився" на шостому і продовжував коректно вітати всіх.
 CONNECTOR_PHRASE_FALLBACK = "Ще одне привітання сьогодні — День народження святкує {name}!"
 
+# Вступні фрази — ТІЛЬКИ для ПЕРШОГО привітання за день (overall_index=1).
+# Одна з них обирається так, щоб не повторюватись протягом 31 дня (див.
+# choose_intro_index / INTRO_HISTORY_DAYS нижче) — щоб розсилка виглядала
+# живіше і не набридала однаковими фразами навіть за цілий місяць. Той
+# самий принцип граматичної безпеки, що й для CONNECTOR_PHRASES: {name}
+# завжди підмет речення ("хто?" святкує), а не пряме звернення — працює
+# коректно для будь-якого імені й прізвища без відмінювання.
+INTRO_PHRASES = [
+    "Друзі, привіт! А ви знали, що сьогодні свій День народження святкує {name}?",
+    "Увага, увага! Сьогодні особливий день — День народження святкує {name}!",
+    "Доброго дня, команда! Поспішаємо повідомити: сьогодні святкує {name}!",
+    "Раді повідомити: сьогодні День народження відзначає {name}!",
+    "Несемо гарну новину: сьогодні День народження святкує {name}!",
+    "Увага, колеги! Сьогодні у нашій команді свято — День народження святкує {name}!",
+    "Народ, зверніть увагу! Сьогодні День народження святкує {name}!",
+    "Ось і чудова новина на сьогодні: День народження відзначає {name}!",
+    "Тримайте цікаву інформацію: сьогодні святкує {name}!",
+    "Ловіть чудову новину дня: святкує {name}!",
+    "Команда, увага! Сьогодні особлива подія — святкує {name}!",
+    "От і привід для радості: сьогодні відзначає своє свято {name}!",
+    "Цікавинка на сьогодні: День народження святкує {name}!",
+    "Спішимо поділитися: сьогодні День народження відзначає {name}!",
+    "Хороші новини не змушують чекати: сьогодні святкує {name}!",
+    "От і чудовий привід зібратися разом: сьогодні відзначає День народження {name}!",
+    "Головна подія дня: День народження святкує {name}!",
+    "Раді анонсувати: сьогодні своє свято відзначає {name}!",
+    "Барабанний дріб! Сьогодні День народження святкує {name}!",
+    "Не проґавте: сьогодні відзначає День народження {name}!",
+    "Сьогодні точно є привід для свята: святкує {name}!",
+    "Тепла новина на ранок: сьогодні святкує {name}!",
+    "Наша команда сьогодні на позитиві — святкує {name}!",
+    "Оголошуємо: сьогодні День народження святкує {name}!",
+    "Це чудовий привід посміхнутися: сьогодні святкує {name}!",
+    "Важлива новина ранку: сьогодні День народження відзначає {name}!",
+    "З самого ранку хороші новини: сьогодні святкує {name}!",
+    "Даруємо усмішку дня: сьогодні відзначає свято {name}!",
+    "Це особливий день для команди: святкує {name}!",
+    "Ще одна причина посміхнутися сьогодні: День народження святкує {name}!",
+    "Оголошення дня: сьогодні своє свято відзначає {name}!",
+]
+
 
 def choose_template_index(excluded_indices: set) -> tuple:
     """Обирає випадковий шаблон, якого НЕ було серед excluded_indices
@@ -144,36 +206,67 @@ def choose_template_index(excluded_indices: set) -> tuple:
     return random.randrange(len(TEMPLATES)), True
 
 
+def choose_intro_index(excluded_indices: set) -> tuple:
+    """Те саме, що choose_template_index, але для INTRO_PHRASES — обирає
+    вступну фразу, якої НЕ було серед excluded_indices (використані за
+    останні 31 день). Повертає (індекс, чи_довелось_повторити)."""
+    available = [i for i in range(len(INTRO_PHRASES)) if i not in excluded_indices]
+    if available:
+        return random.choice(available), False
+    return random.randrange(len(INTRO_PHRASES)), True
+
+
 def build_greeting(
     full_name: str,
     city: str = "",
     city_type: str = "",
     overall_index: int = 1,
     excluded_template_indices: set = frozenset(),
-) -> tuple:
+    excluded_intro_indices: set = frozenset(),
+) -> dict:
     """overall_index — це порядковий номер цього привітання серед усіх
-    сьогоднішніх (1 = перше за день, 2 = друге, і т.д.). Для першого
-    привітання жодного переходу не додається — просто звичайний шаблон.
+    сьогоднішніх (1 = перше за день, 2 = друге, і т.д.).
+    - Перше привітання (overall_index=1) отримує вступну фразу
+      (INTRO_PHRASES), яка НЕ повторюється протягом 31 дня — "Прізвище
+      Ім'я" підметом, у стилі "А ви знали, що сьогодні святкує...".
+    - Кожне наступне (2, 3, ...) отримує фразу-перехід (CONNECTOR_PHRASES).
 
-    excluded_template_indices — шаблони, використані за останні 7 днів
-    (включно з сьогоднішніми вже відправленими) — вони НЕ обираються, щоб
-    жодні два привітання за тиждень не збігались.
+    excluded_template_indices — шаблони, використані за останні 7 днів.
+    excluded_intro_indices — вступні фрази, використані за останні 31 день.
+    Обидва списки виключаються з вибору, щоб нічого не повторювалось.
 
-    Основний текст привітання отримує "Ім'я Прізвище з м. Місто" (якщо
-    місто відоме), а фраза-перехід — просто "Ім'я Прізвище" без міста,
-    щоб не перевантажувати повідомлення повторенням.
+    Основний текст привітання отримує тільки ім'я (+ місто, якщо відоме),
+    а верхня частина (вступ чи перехід) — "Прізвище Ім'я" без міста, щоб
+    не перевантажувати повідомлення повторенням.
 
-    Повертає (текст, номер_шаблону, чи_довелось_повторити)."""
-    template_idx, had_to_repeat = choose_template_index(excluded_template_indices)
+    Повертає словник:
+      {"text": ..., "template_idx": ..., "template_repeated": bool,
+       "intro_idx": int | None, "intro_repeated": bool}
+    ("intro_idx" є тільки для overall_index<=1, інакше None)."""
+    template_idx, template_repeated = choose_template_index(excluded_template_indices)
     template = TEMPLATES[template_idx]
     greeting_text = template.format(name=get_name_with_city(full_name, city, city_type))
 
-    if overall_index > 1:
+    intro_idx = None
+    intro_repeated = False
+
+    if overall_index <= 1:
+        intro_idx, intro_repeated = choose_intro_index(excluded_intro_indices)
+        intro_template = INTRO_PHRASES[intro_idx]
+        intro_text = intro_template.format(name=get_surname_first_name(full_name))
+        greeting_text = f"{intro_text}\n\n{greeting_text}"
+    else:
         connector_template = CONNECTOR_PHRASES.get(overall_index, CONNECTOR_PHRASE_FALLBACK)
         connector_text = connector_template.format(name=get_surname_first_name(full_name))
         greeting_text = f"{connector_text}\n\n{greeting_text}"
 
-    return greeting_text, template_idx, had_to_repeat
+    return {
+        "text": greeting_text,
+        "template_idx": template_idx,
+        "template_repeated": template_repeated,
+        "intro_idx": intro_idx,
+        "intro_repeated": intro_repeated,
+    }
 
 
 
@@ -205,13 +298,15 @@ def today_str(now: datetime = None) -> str:
 def run_once():
     """Виконує один цикл перевірки. Повертає короткий текстовий статус
     (використовується у /health для діагностики)."""
-    global _last_seen_day, _sent_keys_memory
+    global _last_seen_day, _sent_keys_memory, _seen_keys_memory
+    global _template_history_memory, _intro_history_memory
     kyiv_now = now_kyiv()
     day = today_str(kyiv_now)
     logger.info("=== Цикл перевірки за %s (%s Києва) ===", day, kyiv_now.strftime("%H:%M"))
 
     try:
         ws = sheets_client.get_worksheet()
+        state_ws = sheets_client.get_state_worksheet()
     except Exception as e:  # noqa: BLE001
         logger.exception("Критична помилка звернення до Google Sheets")
         telegram_client.log(
@@ -221,18 +316,19 @@ def run_once():
         return "error: google sheets unavailable"
 
     # 1. Визначаємо, чи справді почався новий день. Довіряємо службовій
-    #    клітинці (таблиці) ТІЛЬКИ якщо це узгоджується з власною пам'яттю
-    #    процесу — інакше вважаємо, що клітинку просто випадково стерли,
-    #    а не що прийшов новий день, і НЕ чистимо стан (захист від
-    #    дублювання).
-    last_clear = sheets_client.get_state_cell(ws, config.STATE_CELL_CLEAR_DATE)
+    #    клітинці (на окремому службовому аркуші) ТІЛЬКИ якщо це
+    #    узгоджується з власною пам'яттю процесу — інакше вважаємо, що
+    #    клітинку просто випадково стерли, а не що прийшов новий день, і
+    #    НЕ чистимо стан (захист від дублювання).
+    last_clear = sheets_client.get_state_cell(state_ws, config.STATE_CELL_CLEAR_DATE)
     genuinely_new_day = (last_clear != day) and (_last_seen_day is None or _last_seen_day != day)
 
     if genuinely_new_day:
-        sheets_client.clear_sent_keys(ws)
-        sheets_client.clear_seen_keys(ws)
-        sheets_client.set_state_cell(ws, config.STATE_CELL_CLEAR_DATE, day)
+        sheets_client.clear_sent_keys(state_ws)
+        sheets_client.clear_seen_keys(state_ws)
+        sheets_client.set_state_cell(state_ws, config.STATE_CELL_CLEAR_DATE, day)
         _sent_keys_memory = set()
+        _seen_keys_memory = set()
     elif last_clear != day:
         # Службова клітинка не відповідає сьогоднішній даті, але пам'ять
         # процесу каже, що сьогодні вже було — просто "лікуємо" клітинку,
@@ -242,7 +338,7 @@ def run_once():
             "уже бачив сьогодні '%s' раніше — НЕ очищую стан, лише "
             "відновлюю клітинку.", day
         )
-        sheets_client.set_state_cell(ws, config.STATE_CELL_CLEAR_DATE, day)
+        sheets_client.set_state_cell(state_ws, config.STATE_CELL_CLEAR_DATE, day)
 
     _last_seen_day = day
 
@@ -253,7 +349,7 @@ def run_once():
     #    раптом "забула" когось (клітинку стерли), пам'ять процесу це
     #    компенсує, і ми "лікуємо" клітинку назад.
     try:
-        sheet_sent_keys = sheets_client.get_sent_keys(ws)
+        sheet_sent_keys = sheets_client.get_sent_keys(state_ws)
         effective_sent_keys = sheet_sent_keys | _sent_keys_memory
         if effective_sent_keys != sheet_sent_keys:
             logger.warning(
@@ -262,11 +358,11 @@ def run_once():
                 len(effective_sent_keys - sheet_sent_keys)
             )
             sheets_client.set_state_cell(
-                ws, config.STATE_CELL_SENT_KEYS,
+                state_ws, config.STATE_CELL_SENT_KEYS,
                 json.dumps(sorted(effective_sent_keys), ensure_ascii=False)
             )
         _sent_keys_memory = effective_sent_keys
-        birthdays, duplicates = sheets_client.get_today_birthdays(ws, effective_sent_keys, today=kyiv_now)
+        birthdays, duplicates, excluded_region = sheets_client.get_today_birthdays(ws, effective_sent_keys, today=kyiv_now)
     except Exception as e:  # noqa: BLE001
         logger.exception("Помилка читання іменинників")
         telegram_client.log(f"⚠️ ПОМИЛКА читання таблиці ({day}): {e}")
@@ -277,7 +373,7 @@ def run_once():
     #     але якщо трапився, попереджаємо один раз на день, щоб ви могли
     #     вручну переконатись, що обидва отримали привітання.
     if duplicates:
-        last_dup_warn = sheets_client.get_state_cell(ws, config.STATE_CELL_DUP_WARNING)
+        last_dup_warn = sheets_client.get_state_cell(state_ws, config.STATE_CELL_DUP_WARNING)
         if last_dup_warn != day:
             names = ", ".join(sorted({d[0]["name"] for d in duplicates}))
             telegram_client.log(
@@ -286,14 +382,14 @@ def run_once():
                 f"як одну особу (одне повідомлення замість двох). Будь ласка, "
                 f"перевірте вручну, чи всі такі люди отримали привітання."
             )
-            sheets_client.set_state_cell(ws, config.STATE_CELL_DUP_WARNING, day)
+            sheets_client.set_state_cell(state_ws, config.STATE_CELL_DUP_WARNING, day)
 
     total = len(birthdays)
 
     # 3. Ранкове зведення — один раз на день, навіть якщо іменинників 0.
     #    Запам'ятовуємо, чи зведення ВЖЕ було до цього циклу (потрібно для
     #    кроку 3б нижче — щоб не плутати "перший цикл дня" з "новоприбулим").
-    last_summary = sheets_client.get_state_cell(ws, config.STATE_CELL_SUMMARY_DATE)
+    last_summary = sheets_client.get_state_cell(state_ws, config.STATE_CELL_SUMMARY_DATE)
     summary_already_existed = last_summary == day
     if not summary_already_existed:
         if total == 0:
@@ -303,25 +399,40 @@ def run_once():
                 f"📋 ЛОГ ({day}): сьогодні День народження у {total} "
                 f"працівник(ів). Очікуємо відправки привітань."
             )
-        sheets_client.set_state_cell(ws, config.STATE_CELL_SUMMARY_DATE, day)
+        if excluded_region:
+            names = ", ".join(sorted(p["name"] for p in excluded_region))
+            telegram_client.log(
+                f"ℹ️ ЛОГ ({day}): ще у {len(excluded_region)} співробітник(ів) "
+                f"регіонального/адміністративного рівня сьогодні також День "
+                f"народження — {names}. Бот їх НЕ вітає (за налаштуванням) — "
+                f"їх привітають окремо безпосередньо керівники."
+            )
+        sheets_client.set_state_cell(state_ws, config.STATE_CELL_SUMMARY_DATE, day)
 
     # 3б. Виявлення НОВИХ іменинників, доданих HR-ом у таблицю ПІСЛЯ того,
     #     як ранкове зведення вже було надіслано (тобто це не перший цикл
     #     дня). Порівнюємо поточний список іменинників з тим, кого бот уже
     #     "бачив" сьогодні раніше — хто з'явився новим, про того окремо
     #     пишемо в логи, щоб було видно, що HR щось додав протягом дня.
+    #     Список "кого вже бачили" читаємо як ОБ'ЄДНАННЯ таблиці й пам'яті
+    #     процесу (той самий принцип лікування, що й для sent_keys) — щоб
+    #     повне стирання клітинки не спричинило хибні "🆕 новий іменинник"
+    #     для людей, яких насправді вже бачили раніше сьогодні.
     current_keys = {b["key"] for b in birthdays}
-    seen_keys = sheets_client.get_seen_keys(ws)
+    sheet_seen_keys = sheets_client.get_seen_keys(state_ws)
+    effective_seen_keys = sheet_seen_keys | _seen_keys_memory
     if summary_already_existed:
-        new_arrivals = [b for b in birthdays if b["key"] not in seen_keys]
+        new_arrivals = [b for b in birthdays if b["key"] not in effective_seen_keys]
         for person in new_arrivals:
             telegram_client.log(
                 f"🆕 ЛОГ ({day}): у таблиці з'явився новий іменинник, якого не "
                 f"було під час ранкового зведення — {person['name']}. "
                 f"Загалом сьогодні іменинників: {total}."
             )
-    if current_keys != seen_keys:
-        sheets_client.set_seen_keys(ws, seen_keys | current_keys)
+    updated_seen_keys = effective_seen_keys | current_keys
+    if updated_seen_keys != sheet_seen_keys:
+        sheets_client.set_seen_keys(state_ws, updated_seen_keys)
+    _seen_keys_memory = updated_seen_keys
 
     if total == 0:
         return "ok: no birthdays today"
@@ -331,12 +442,12 @@ def run_once():
 
     # 4. Усіх уже привітано -> лог один раз
     if not pending:
-        last_done = sheets_client.get_state_cell(ws, config.STATE_CELL_DONE_DATE)
+        last_done = sheets_client.get_state_cell(state_ws, config.STATE_CELL_DONE_DATE)
         if last_done != day:
             telegram_client.log(
                 f"🎉 ЛОГ ({day}): усіх {total} іменинник(ів) успішно привітано."
             )
-            sheets_client.set_state_cell(ws, config.STATE_CELL_DONE_DATE, day)
+            sheets_client.set_state_cell(state_ws, config.STATE_CELL_DONE_DATE, day)
         return "ok: all greeted"
 
     # 4б. Є кому вітати, але зараз поза "робочим вікном" (10:00-20:00 за
@@ -352,28 +463,68 @@ def run_once():
         )
         return "ok: waiting for sending window (10:00-20:00 Kyiv)"
 
-    # 5. Надсилаємо РІВНО ОДНЕ привітання за цей цикл. Шаблон обираємо
-    #    так, щоб він НЕ повторював жоден шаблон, використаний за останні
-    #    7 днів (включно з сьогоднішніми вже відправленими) — це і є
-    #    захист "жодні два привітання за тиждень не мають збігатись".
+    # 5. Надсилаємо РІВНО ОДНЕ привітання за цей цикл. Шаблон основного
+    #    тексту обираємо так, щоб він НЕ повторював жоден шаблон,
+    #    використаний за останні 7 днів. Якщо це ПЕРШЕ привітання за
+    #    день (overall_index=1) — так само обираємо вступну фразу, яка
+    #    НЕ повторювалась за останні 31 день.
+    #
+    #    Обидві історії читаємо як ОБ'ЄДНАННЯ службового аркуша й пам'яті
+    #    процесу (той самий принцип лікування, що й для sent_keys/seen_keys).
     person = pending[0]
     overall_index = already_done + 1
+    today_naive = kyiv_now.replace(tzinfo=None)
+
     try:
-        excluded_indices = sheets_client.get_recently_used_template_indices(ws)
+        sheet_template_pairs = {(e["date"], e["idx"]) for e in sheets_client.get_template_history(state_ws)}
+        _template_history_memory = _prune_history_pairs(
+            _template_history_memory, config.TEMPLATE_HISTORY_DAYS, today_naive
+        )
+        effective_template_pairs = sheet_template_pairs | _template_history_memory
+        if effective_template_pairs != sheet_template_pairs:
+            sheets_client.set_template_history(
+                state_ws, [{"date": d, "idx": i} for d, i in sorted(effective_template_pairs)]
+            )
+        excluded_template_indices = {i for _, i in effective_template_pairs}
     except Exception:  # noqa: BLE001
         logger.exception("Не вдалося прочитати історію шаблонів, продовжую без обмежень")
-        excluded_indices = set()
+        excluded_template_indices = set()
 
-    text, template_idx, had_to_repeat = build_greeting(
+    excluded_intro_indices = set()
+    if overall_index <= 1:
+        try:
+            sheet_intro_pairs = {(e["date"], e["idx"]) for e in sheets_client.get_intro_history(state_ws)}
+            _intro_history_memory = _prune_history_pairs(
+                _intro_history_memory, config.INTRO_HISTORY_DAYS, today_naive
+            )
+            effective_intro_pairs = sheet_intro_pairs | _intro_history_memory
+            if effective_intro_pairs != sheet_intro_pairs:
+                sheets_client.set_intro_history(
+                    state_ws, [{"date": d, "idx": i} for d, i in sorted(effective_intro_pairs)]
+                )
+            excluded_intro_indices = {i for _, i in effective_intro_pairs}
+        except Exception:  # noqa: BLE001
+            logger.exception("Не вдалося прочитати історію вступних фраз, продовжую без обмежень")
+
+    greeting = build_greeting(
         person["name"], person.get("city", ""), person.get("city_type", ""),
-        overall_index, excluded_indices,
+        overall_index, excluded_template_indices, excluded_intro_indices,
     )
-    if had_to_repeat:
+    text = greeting["text"]
+
+    if greeting["template_repeated"]:
         telegram_client.log(
             f"⚠️ УВАГА ({day}): усі шаблони привітань були використані за "
             f"останні {config.TEMPLATE_HISTORY_DAYS} днів — довелось "
             f"повторити один із них. Рекомендую додати більше варіантів "
             f"у templates.py."
+        )
+    if greeting["intro_repeated"]:
+        telegram_client.log(
+            f"⚠️ УВАГА ({day}): усі вступні фрази були використані за "
+            f"останні {config.INTRO_HISTORY_DAYS} днів — довелось "
+            f"повторити одну з них. Рекомендую додати більше варіантів "
+            f"у списку INTRO_PHRASES (bot_logic.py)."
         )
 
     ok = telegram_client.send_message(config.TARGET_CHAT_ID, config.TARGET_TOPIC_ID, text)
@@ -381,10 +532,15 @@ def run_once():
     if ok:
         try:
             # Джерело істини — ключ Ім'я+Дата+Підрозділ, незалежний від
-            # номера рядка. Зберігаємо і в таблицю, і в пам'ять процесу.
-            sheets_client.add_sent_key(ws, person["key"])
+            # номера рядка. Зберігаємо і на службовому аркуші, і в пам'ять
+            # процесу.
+            sheets_client.add_sent_key(state_ws, person["key"])
             _sent_keys_memory.add(person["key"])
-            sheets_client.add_template_history_entry(ws, day, template_idx)
+            sheets_client.add_template_history_entry(state_ws, day, greeting["template_idx"])
+            _template_history_memory.add((day, greeting["template_idx"]))
+            if greeting["intro_idx"] is not None:
+                sheets_client.add_intro_history_entry(state_ws, day, greeting["intro_idx"])
+                _intro_history_memory.add((day, greeting["intro_idx"]))
         except Exception:  # noqa: BLE001
             logger.exception("Не вдалося зберегти позначку 'відправлено' для %s", person["name"])
         telegram_client.log(f"✅ Привітання {overall_index}/{total} — готово ({person['name']}).")
@@ -395,3 +551,4 @@ def run_once():
             f"({person['name']}). Спробуємо ще раз наступним циклом."
         )
         return "error: telegram send failed"
+
