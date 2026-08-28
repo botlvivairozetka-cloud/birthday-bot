@@ -35,6 +35,7 @@ import logging
 import random
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import config
 import sheets_client
@@ -115,36 +116,87 @@ CONNECTOR_PHRASES = {
 CONNECTOR_PHRASE_FALLBACK = "Ще одне привітання сьогодні — з Днем народження, {name}!"
 
 
-def build_greeting(full_name: str, city: str = "", city_type: str = "", overall_index: int = 1) -> str:
+def choose_template_index(excluded_indices: set) -> tuple:
+    """Обирає випадковий шаблон, якого НЕ було серед excluded_indices
+    (шаблони, використані за останні 7 днів). Повертає (індекс, чи_довелось_повторити).
+
+    Якщо ВСІ шаблони виявились виключеними (малоймовірно при достатній
+    кількості шаблонів, але можливо в дуже "завантажений" тиждень) —
+    доводиться повторити якийсь шаблон, і про це повертається прапорець,
+    щоб bot_logic міг попередити в логах."""
+    available = [i for i in range(len(TEMPLATES)) if i not in excluded_indices]
+    if available:
+        return random.choice(available), False
+    # Резерв: пул шаблонів вичерпано за останній тиждень. Це сигнал, що
+    # варто додати більше шаблонів у templates.py (див. README).
+    return random.randrange(len(TEMPLATES)), True
+
+
+def build_greeting(
+    full_name: str,
+    city: str = "",
+    city_type: str = "",
+    overall_index: int = 1,
+    excluded_template_indices: set = frozenset(),
+) -> tuple:
     """overall_index — це порядковий номер цього привітання серед усіх
     сьогоднішніх (1 = перше за день, 2 = друге, і т.д.). Для першого
     привітання жодного переходу не додається — просто звичайний шаблон.
 
+    excluded_template_indices — шаблони, використані за останні 7 днів
+    (включно з сьогоднішніми вже відправленими) — вони НЕ обираються, щоб
+    жодні два привітання за тиждень не збігались.
+
     Основний текст привітання отримує "Ім'я Прізвище з м. Місто" (якщо
     місто відоме), а фраза-перехід — просто "Ім'я Прізвище" без міста,
-    щоб не перевантажувати повідомлення повторенням."""
-    template = random.choice(TEMPLATES)
+    щоб не перевантажувати повідомлення повторенням.
+
+    Повертає (текст, номер_шаблону, чи_довелось_повторити)."""
+    template_idx, had_to_repeat = choose_template_index(excluded_template_indices)
+    template = TEMPLATES[template_idx]
     greeting_text = template.format(name=get_name_with_city(full_name, city, city_type))
 
-    if overall_index <= 1:
-        return greeting_text
+    if overall_index > 1:
+        connector_template = CONNECTOR_PHRASES.get(overall_index, CONNECTOR_PHRASE_FALLBACK)
+        connector_text = connector_template.format(name=get_display_name(full_name))
+        greeting_text = f"{connector_text}\n\n{greeting_text}"
 
-    connector_template = CONNECTOR_PHRASES.get(overall_index, CONNECTOR_PHRASE_FALLBACK)
-    connector_text = connector_template.format(name=get_display_name(full_name))
-    return f"{connector_text}\n\n{greeting_text}"
+    return greeting_text, template_idx, had_to_repeat
 
 
 
-def today_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+def now_kyiv() -> datetime:
+    """Поточний час, ЯВНО у часовому поясі Europe/Kyiv (config.TIMEZONE) —
+    а не системний час сервера. Це важливо, бо Render зазвичай працює в
+    UTC: без явного переведення в київський час "новий день" міг би
+    наставати на 2-3 години раніше/пізніше реальної київської півночі,
+    а вікно відправки (10:00-20:00) рахувалось би за неправильною
+    годиною."""
+    return datetime.now(ZoneInfo(config.TIMEZONE))
+
+
+def is_within_sending_window(now: datetime) -> bool:
+    """Чи можна прямо зараз надсилати привітання (10:00-20:00 за Києвом,
+    налаштовується через SEND_WINDOW_START_HOUR / SEND_WINDOW_END_HOUR).
+    Поза цим вікном бот усе одно перевіряє таблицю, пише ранкове
+    зведення і т.д. — просто НЕ надсилає сам текст привітання, аж поки
+    не настане 10:00."""
+    return config.SEND_WINDOW_START_HOUR <= now.hour < config.SEND_WINDOW_END_HOUR
+
+
+def today_str(now: datetime = None) -> str:
+    if now is None:
+        now = now_kyiv()
+    return now.strftime("%Y-%m-%d")
 
 
 def run_once():
     """Виконує один цикл перевірки. Повертає короткий текстовий статус
     (використовується у /health для діагностики)."""
     global _last_seen_day, _sent_keys_memory
-    day = today_str()
-    logger.info("=== Цикл перевірки за %s ===", day)
+    kyiv_now = now_kyiv()
+    day = today_str(kyiv_now)
+    logger.info("=== Цикл перевірки за %s (%s Києва) ===", day, kyiv_now.strftime("%H:%M"))
 
     try:
         ws = sheets_client.get_worksheet()
@@ -202,7 +254,7 @@ def run_once():
                 json.dumps(sorted(effective_sent_keys), ensure_ascii=False)
             )
         _sent_keys_memory = effective_sent_keys
-        birthdays, duplicates = sheets_client.get_today_birthdays(ws, effective_sent_keys)
+        birthdays, duplicates = sheets_client.get_today_birthdays(ws, effective_sent_keys, today=kyiv_now)
     except Exception as e:  # noqa: BLE001
         logger.exception("Помилка читання іменинників")
         telegram_client.log(f"⚠️ ПОМИЛКА читання таблиці ({day}): {e}")
@@ -275,10 +327,43 @@ def run_once():
             sheets_client.set_state_cell(ws, config.STATE_CELL_DONE_DATE, day)
         return "ok: all greeted"
 
-    # 5. Надсилаємо РІВНО ОДНЕ привітання за цей цикл
+    # 4б. Є кому вітати, але зараз поза "робочим вікном" (10:00-20:00 за
+    #     Києвом) -> нічого не надсилаємо цим циклом, просто чекаємо.
+    #     Наступний цикл (за ~2 хв) перевірить знову, і як тільки настане
+    #     10:00 — розсилка почнеться автоматично, без жодного втручання.
+    if not is_within_sending_window(kyiv_now):
+        logger.info(
+            "Є %s непривітаних, але зараз %s Києва — поза вікном "
+            "%02d:00-%02d:00, чекаємо.",
+            len(pending), kyiv_now.strftime("%H:%M"),
+            config.SEND_WINDOW_START_HOUR, config.SEND_WINDOW_END_HOUR
+        )
+        return "ok: waiting for sending window (10:00-20:00 Kyiv)"
+
+    # 5. Надсилаємо РІВНО ОДНЕ привітання за цей цикл. Шаблон обираємо
+    #    так, щоб він НЕ повторював жоден шаблон, використаний за останні
+    #    7 днів (включно з сьогоднішніми вже відправленими) — це і є
+    #    захист "жодні два привітання за тиждень не мають збігатись".
     person = pending[0]
     overall_index = already_done + 1
-    text = build_greeting(person["name"], person.get("city", ""), person.get("city_type", ""), overall_index)
+    try:
+        excluded_indices = sheets_client.get_recently_used_template_indices(ws)
+    except Exception:  # noqa: BLE001
+        logger.exception("Не вдалося прочитати історію шаблонів, продовжую без обмежень")
+        excluded_indices = set()
+
+    text, template_idx, had_to_repeat = build_greeting(
+        person["name"], person.get("city", ""), person.get("city_type", ""),
+        overall_index, excluded_indices,
+    )
+    if had_to_repeat:
+        telegram_client.log(
+            f"⚠️ УВАГА ({day}): усі шаблони привітань були використані за "
+            f"останні {config.TEMPLATE_HISTORY_DAYS} днів — довелось "
+            f"повторити один із них. Рекомендую додати більше варіантів "
+            f"у templates.py."
+        )
+
     ok = telegram_client.send_message(config.TARGET_CHAT_ID, config.TARGET_TOPIC_ID, text)
 
     if ok:
@@ -287,6 +372,7 @@ def run_once():
             # номера рядка. Зберігаємо і в таблицю, і в пам'ять процесу.
             sheets_client.add_sent_key(ws, person["key"])
             _sent_keys_memory.add(person["key"])
+            sheets_client.add_template_history_entry(ws, day, template_idx)
         except Exception:  # noqa: BLE001
             logger.exception("Не вдалося зберегти позначку 'відправлено' для %s", person["name"])
         telegram_client.log(f"✅ Привітання {overall_index}/{total} — готово ({person['name']}).")

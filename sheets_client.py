@@ -17,7 +17,7 @@ import re
 import time
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -83,11 +83,19 @@ def parse_location_line(line: str) -> tuple:
     return ("", "")
 
 
-def get_today_birthdays(ws, sent_keys: set):
+def get_today_birthdays(ws, sent_keys: set, today: datetime = None):
     """Повертає список іменинників на сьогодні:
     [{"row": <номер рядка>, "name": str, "date_str": str, "section": str,
       "city": str, "key": str, "sent": bool}, ...]
     Порівняння дати йде тільки по дню і місяцю (рік ігнорується).
+
+    "today" — момент, який вважати "сьогодні". Якщо не передано —
+    використовується системний час сервера (за замовчуванням для
+    зворотної сумісності/тестів), але bot_logic.py ЗАВЖДИ передає явно
+    поточний час за Києвом (Europe/Kyiv), а не системний час сервера —
+    це важливо, бо Render зазвичай працює в UTC, і без явної передачі
+    "новий день" міг би наставати на 2-3 години раніше чи пізніше
+    реальної київської півночі.
 
     ВАЖЛИВО: "sent" визначається за ключем "Ім'я + Дата народження +
     Підрозділ" (key), яка звіряється зі списком sent_keys — незалежним
@@ -114,7 +122,8 @@ def get_today_birthdays(ws, sent_keys: set):
     повторення назви магазину, хоча фактично працюють у тому самому
     магазині, що й попередній блок."""
     rows = read_rows(ws)
-    today = datetime.now()
+    if today is None:
+        today = datetime.now()
     result = []
     section_parts = []
     last_was_employee = True  # щоб перший блок заголовків теж накопичився
@@ -280,3 +289,51 @@ def set_seen_keys(ws, keys: set):
 
 def clear_seen_keys(ws):
     set_state_cell(ws, config.STATE_CELL_SEEN_KEYS, "")
+
+
+# ---------------------------------------------------------------------------
+# Історія використаних шаблонів привітань (щоб жодні два привітання за
+# останні 7 днів не повторювались — навіть для різних людей).
+# Зберігається як список записів [{"date": "YYYY-MM-DD", "idx": N}, ...],
+# де idx — номер шаблону в списку TEMPLATES (templates.py). Записи
+# старші за TEMPLATE_HISTORY_DAYS автоматично відсіюються при кожному
+# читанні, тому клітинка сама "чиститься" і не росте нескінченно.
+# ---------------------------------------------------------------------------
+def get_template_history(ws) -> list:
+    raw = get_state_cell(ws, config.STATE_CELL_TEMPLATE_HISTORY)
+    if not raw:
+        return []
+    try:
+        entries = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+    cutoff = datetime.now() - timedelta(days=config.TEMPLATE_HISTORY_DAYS)
+    fresh = []
+    for entry in entries:
+        try:
+            entry_date = datetime.strptime(entry["date"], "%Y-%m-%d")
+        except (KeyError, ValueError, TypeError):
+            continue
+        if entry_date >= cutoff:
+            fresh.append(entry)
+    return fresh
+
+
+def add_template_history_entry(ws, date_str: str, template_idx: int):
+    """Додає запис про використаний шаблон і одразу відсіює застарілі
+    (старші за TEMPLATE_HISTORY_DAYS) — так клітинка сама не росте
+    нескінченно."""
+    entries = get_template_history(ws)  # вже відфільтровані свіжі
+    entries.append({"date": date_str, "idx": template_idx})
+    set_state_cell(
+        ws, config.STATE_CELL_TEMPLATE_HISTORY,
+        json.dumps(entries, ensure_ascii=False)
+    )
+
+
+def get_recently_used_template_indices(ws) -> set:
+    """Множина номерів шаблонів, використаних за останні
+    TEMPLATE_HISTORY_DAYS днів (включно з сьогодні) — саме цю множину
+    треба виключити при виборі наступного шаблону."""
+    return {entry["idx"] for entry in get_template_history(ws)}
