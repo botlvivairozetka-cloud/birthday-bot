@@ -64,10 +64,29 @@ def read_rows(ws):
     return _retry(ws.get_all_values)
 
 
+def parse_location_line(line: str) -> tuple:
+    """Перевіряє, чи ЦЕЙ КОНКРЕТНИЙ рядок-заголовок є явним визначенням
+    локації — магазином ("ТВ <Місто> <адреса>") чи регіоном (містить
+    слово "регіон"). Повертає (назва, тип) або ("", "") якщо це просто
+    назва відділу/ролі (наприклад "Обслуговуючий персонал", "Торговий
+    персонал") — такі рядки НЕ є визначенням локації."""
+    p = line.strip()
+    if p.startswith("ТВ "):
+        rest = p[3:].strip()
+        tokens = rest.split()
+        if tokens:
+            city = tokens[0].rstrip(",.")
+            city = city.replace("\u2019", "'")  # нормалізація апострофа
+            return (city, "city")
+    if "регіон" in p.lower():
+        return (p, "region")
+    return ("", "")
+
+
 def get_today_birthdays(ws, sent_keys: set):
     """Повертає список іменинників на сьогодні:
     [{"row": <номер рядка>, "name": str, "date_str": str, "section": str,
-      "key": str, "sent": bool}, ...]
+      "city": str, "key": str, "sent": bool}, ...]
     Порівняння дати йде тільки по дню і місяцю (рік ігнорується).
 
     ВАЖЛИВО: "sent" визначається за ключем "Ім'я + Дата народження +
@@ -82,12 +101,29 @@ def get_today_birthdays(ws, sent_keys: set):
     це і є третя складова ключа, яка додатково захищає від колізій, якщо
     в компанії є двоє тезок з однаковою датою народження (реальний ризик
     при поширених іменах і високій плинності кадрів).
-    """
+
+    "city" — окремо витягнуте місто/населений пункт, яке визначається
+    ІНАКШЕ, ніж "section": замість того щоб дивитись тільки на поточний
+    ланцюжок заголовків (який скидається на кожному новому блоці типу
+    "Торговий персонал"), бот "тягне вперед" останнє явно визначене
+    місто/регіон через УВЕСЬ файл — тобто дивиться не тільки в межах
+    поточного блоку, а й вище, аж до попереднього магазину/регіону, якщо
+    в поточному блоці своєї явної локації немає. Це потрібно, бо у
+    вихідних даних (як їх формує ваша БД) деякі відділи (наприклад
+    "Відділ технічної підтримки") виносяться окремим блоком БЕЗ
+    повторення назви магазину, хоча фактично працюють у тому самому
+    магазині, що й попередній блок."""
     rows = read_rows(ws)
     today = datetime.now()
     result = []
     section_parts = []
     last_was_employee = True  # щоб перший блок заголовків теж накопичився
+    # "Пам'ять" про останню явно визначену локацію — НЕ скидається між
+    # блоками відділів, тільки коли зустрічається НОВЕ явне визначення
+    # (новий магазин чи новий регіон).
+    last_known_city = ""
+    last_known_city_type = ""
+    region_found_this_chain = False
     for idx, row in enumerate(rows, start=1):
         if idx == 1:
             continue  # заголовок таблиці
@@ -106,8 +142,28 @@ def get_today_birthdays(ws, sent_keys: set):
             if section_text:
                 if last_was_employee:
                     section_parts = [section_text]  # новий ланцюжок з нуля
+                    region_found_this_chain = False
                 else:
                     section_parts.append(section_text)  # продовжуємо вкладеність
+                # Перевіряємо, чи саме ЦЕЙ рядок є явним визначенням
+                # локації — якщо так, оновлюємо "пам'ять" (не скидаємо
+                # на звичайних рядках типу "Торговий персонал").
+                #
+                # Для магазину ("ТВ ...") — оновлюємо ЗАВЖДИ, останній
+                # знайдений магазин має пріоритет (найточніша, найсвіжіша
+                # локація).
+                # Для регіону — оновлюємо ТІЛЬКИ якщо в поточному
+                # ланцюжку заголовків це ПЕРШИЙ такий рядок. Це важливо,
+                # бо в одному ланцюжку часто є одразу два рядки зі словом
+                # "регіон" (наприклад "Львівський регіон" і нижче
+                # "Адміністративна команда (Львівський регіон)") — і без
+                # цього правила бот узяв би довший, менш чистий варіант.
+                loc_name, loc_type = parse_location_line(section_text)
+                if loc_type == "city":
+                    last_known_city, last_known_city_type = loc_name, loc_type
+                elif loc_type == "region" and not region_found_this_chain:
+                    last_known_city, last_known_city_type = loc_name, loc_type
+                    region_found_this_chain = True
             last_was_employee = False
             continue
         try:
@@ -123,6 +179,8 @@ def get_today_birthdays(ws, sent_keys: set):
                 "name": name,
                 "date_str": raw_date,
                 "section": current_section,
+                "city": last_known_city,
+                "city_type": last_known_city_type,
                 "key": key,
                 "sent": key in sent_keys,
             })
@@ -142,6 +200,7 @@ def get_today_birthdays(ws, sent_keys: set):
         logger.warning("Знайдено %s колізій ключів серед сьогоднішніх іменинників", len(duplicates))
 
     return result, duplicates
+
 
 
 def make_person_key(name: str, date_str: str, section: str = "") -> str:

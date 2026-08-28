@@ -70,6 +70,35 @@ def get_first_name(full_name: str) -> str:
     return full_name
 
 
+def get_display_name(full_name: str) -> str:
+    """ПІБ у форматі 'Прізвище Ім'я По-батькові' -> повертає 'Ім'я Прізвище'
+    (природніший порядок для звертання в привітанні, ніж офіційний ПІБ)."""
+    parts = full_name.split()
+    if len(parts) >= 2:
+        surname, first_name = parts[0], parts[1]
+        return f"{first_name} {surname}"
+    return full_name
+
+
+def get_name_with_city(full_name: str, city: str = "", city_type: str = "") -> str:
+    """'Ім'я Прізвище' + місто, вказане прямо в тексті (без дужок):
+    - якщо це справжнє місто/магазин (city_type="city") -> "з м. Львів";
+    - якщо це регіон/адмінструктура без конкретного міста
+      (city_type="region", напр. "Львівський регіон") -> через тире,
+      без "м." (граматично неправильно казати "м. Львівський регіон") ->
+      "— Львівський регіон";
+    - якщо міста не визначено взагалі -> просто ім'я і прізвище, без
+      жодної згадки міста."""
+    display_name = get_display_name(full_name)
+    if not city:
+        return display_name
+    if city_type == "city":
+        return f"{display_name} з м. {city}"
+    if city_type == "region":
+        return f"{display_name} — {city}"
+    return display_name
+
+
 # Фрази-переходи для 2-го, 3-го, 4-го, 5-го, 6-го привітання за один день
 # (якщо іменинників кілька). Перше привітання за день йде БЕЗ переходу —
 # просто звичайний шаблон з templates.py. Кожен наступний починається з
@@ -86,19 +115,24 @@ CONNECTOR_PHRASES = {
 CONNECTOR_PHRASE_FALLBACK = "Ще одне привітання сьогодні — з Днем народження, {name}!"
 
 
-def build_greeting(full_name: str, overall_index: int = 1) -> str:
+def build_greeting(full_name: str, city: str = "", city_type: str = "", overall_index: int = 1) -> str:
     """overall_index — це порядковий номер цього привітання серед усіх
     сьогоднішніх (1 = перше за день, 2 = друге, і т.д.). Для першого
-    привітання жодного переходу не додається — просто звичайний шаблон."""
+    привітання жодного переходу не додається — просто звичайний шаблон.
+
+    Основний текст привітання отримує "Ім'я Прізвище з м. Місто" (якщо
+    місто відоме), а фраза-перехід — просто "Ім'я Прізвище" без міста,
+    щоб не перевантажувати повідомлення повторенням."""
     template = random.choice(TEMPLATES)
-    greeting_text = template.format(name=get_first_name(full_name))
+    greeting_text = template.format(name=get_name_with_city(full_name, city, city_type))
 
     if overall_index <= 1:
         return greeting_text
 
     connector_template = CONNECTOR_PHRASES.get(overall_index, CONNECTOR_PHRASE_FALLBACK)
-    connector_text = connector_template.format(name=get_first_name(full_name))
+    connector_text = connector_template.format(name=get_display_name(full_name))
     return f"{connector_text}\n\n{greeting_text}"
+
 
 
 def today_str() -> str:
@@ -244,7 +278,7 @@ def run_once():
     # 5. Надсилаємо РІВНО ОДНЕ привітання за цей цикл
     person = pending[0]
     overall_index = already_done + 1
-    text = build_greeting(person["name"], overall_index)
+    text = build_greeting(person["name"], person.get("city", ""), person.get("city_type", ""), overall_index)
     ok = telegram_client.send_message(config.TARGET_CHAT_ID, config.TARGET_TOPIC_ID, text)
 
     if ok:
