@@ -71,49 +71,61 @@ def get_first_name(full_name: str) -> str:
     return full_name
 
 
-def get_display_name(full_name: str) -> str:
-    """ПІБ у форматі 'Прізвище Ім'я По-батькові' -> повертає 'Ім'я Прізвище'
-    (природніший порядок для звертання в привітанні, ніж офіційний ПІБ)."""
+def get_surname_first_name(full_name: str) -> str:
+    """ПІБ у форматі 'Прізвище Ім'я По-батькові' -> повертає
+    'Прізвище Ім'я' (для фрази-переходу — верхньої частини повідомлення,
+    коли за день кілька іменинників)."""
     parts = full_name.split()
     if len(parts) >= 2:
         surname, first_name = parts[0], parts[1]
-        return f"{first_name} {surname}"
+        return f"{surname} {first_name}"
     return full_name
 
 
 def get_name_with_city(full_name: str, city: str = "", city_type: str = "") -> str:
-    """'Ім'я Прізвище' + місто, вказане прямо в тексті (без дужок):
+    """Ім'я (без прізвища — воно вже було у фразі-переході вище, якщо
+    вона є) + місто, вказане прямо в тексті (без дужок):
     - якщо це справжнє місто/магазин (city_type="city") -> "з м. Львів";
     - якщо це регіон/адмінструктура без конкретного міста
       (city_type="region", напр. "Львівський регіон") -> через тире,
       без "м." (граматично неправильно казати "м. Львівський регіон") ->
       "— Львівський регіон";
-    - якщо міста не визначено взагалі -> просто ім'я і прізвище, без
-      жодної згадки міста."""
-    display_name = get_display_name(full_name)
+    - якщо міста не визначено взагалі -> просто ім'я, без жодної згадки
+      міста."""
+    first_name = get_first_name(full_name)
     if not city:
-        return display_name
+        return first_name
     if city_type == "city":
-        return f"{display_name} з м. {city}"
+        return f"{first_name} з м. {city}"
     if city_type == "region":
-        return f"{display_name} — {city}"
-    return display_name
+        return f"{first_name} — {city}"
+    return first_name
 
 
 # Фрази-переходи для 2-го, 3-го, 4-го, 5-го, 6-го привітання за один день
 # (якщо іменинників кілька). Перше привітання за день йде БЕЗ переходу —
 # просто звичайний шаблон з templates.py. Кожен наступний починається з
 # такої фрази-місточка, а тоді вже йде сам текст привітання.
+#
+# ВАЖЛИВО: усі фрази побудовані так, щоб {name} завжди був ПІДМЕТОМ
+# речення в називному відмінку ("хто?" святкує/відзначає), а НЕ прямим
+# звертанням через кому ("з Днем народження, {name}!"). Це навмисно —
+# такі конструкції залишаються граматично коректними для БУДЬ-ЯКОГО
+# імені й прізвища без необхідності їх відмінювати (а правильне
+# автоматичне відмінювання довільних українських імен — дуже складна
+# задача). Якщо додаєте власні фрази-переходи — тримайтесь того самого
+# принципу: {name} має бути тим, ХТО щось робить (підмет), а не тим, ДО
+# КОГО звертаються напряму.
 CONNECTOR_PHRASES = {
     2: "Також сьогодні День народження святкує {name}!",
     3: "А ще сьогодні свій День народження відзначає {name}!",
-    4: "Ну і як же без привітання — з Днем народження, {name}!",
-    5: "І звісно ж привітаємо також {name}!",
-    6: "І на останок привітання ще отримає {name}!",
+    4: "Сьогодні День народження святкує також {name}!",
+    5: "І {name} сьогодні відзначає своє свято!",
+    6: "До сьогоднішніх привітань долучається {name}!",
 }
 # Резервна фраза, якщо іменинників за день виявиться більше шести —
 # щоб бот не "закінчився" на шостому і продовжував коректно вітати всіх.
-CONNECTOR_PHRASE_FALLBACK = "Ще одне привітання сьогодні — з Днем народження, {name}!"
+CONNECTOR_PHRASE_FALLBACK = "Ще одне привітання сьогодні — День народження святкує {name}!"
 
 
 def choose_template_index(excluded_indices: set) -> tuple:
@@ -158,7 +170,7 @@ def build_greeting(
 
     if overall_index > 1:
         connector_template = CONNECTOR_PHRASES.get(overall_index, CONNECTOR_PHRASE_FALLBACK)
-        connector_text = connector_template.format(name=get_display_name(full_name))
+        connector_text = connector_template.format(name=get_surname_first_name(full_name))
         greeting_text = f"{connector_text}\n\n{greeting_text}"
 
     return greeting_text, template_idx, had_to_repeat
