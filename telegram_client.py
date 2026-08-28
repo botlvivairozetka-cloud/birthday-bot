@@ -15,10 +15,19 @@ def send_message(chat_id: int, topic_id: int, text: str, retries: int = 3) -> bo
     url = API_URL.format(token=config.BOT_TOKEN)
     payload = {
         "chat_id": chat_id,
-        "message_thread_id": topic_id,
         "text": text,
         "parse_mode": "HTML",
     }
+    # Гілка "General" у форумах Telegram — це НЕ звичайна гілка з ID.
+    # Щоб писати саме в General, параметр message_thread_id взагалі не
+    # передається (а не передається як 1 чи будь-яке інше число) —
+    # інакше Telegram відповідає "Bad Request: message thread not found",
+    # бо шукає окрему створену гілку з таким ID, якої не існує.
+    # Тому: якщо topic_id == 0 (або не задано) — це означає "General",
+    # і ми просто НЕ додаємо message_thread_id в запит.
+    if topic_id:
+        payload["message_thread_id"] = topic_id
+
     last_err = None
     for attempt in range(1, retries + 1):
         try:
@@ -39,3 +48,4 @@ def send_message(chat_id: int, topic_id: int, text: str, retries: int = 3) -> bo
 def log(text: str):
     """Надсилає повідомлення в системну гілку логів."""
     send_message(config.LOG_CHAT_ID, config.LOG_TOPIC_ID, text)
+
