@@ -30,7 +30,7 @@ logger = logging.getLogger("birthday_bot.sheets")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}$")
 
 
 def _client():
