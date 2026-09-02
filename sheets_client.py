@@ -257,12 +257,22 @@ def get_today_birthdays(ws, sent_keys: set, today: datetime = None):
             # у ключі спричиняло реальний баг: одна й та сама людина під
             # час дрібного редагування HR-ом ставала "новою" з точки зору
             # бота і отримувала повторне привітання.
+            #
+            # ТАК САМО дату для ключа беремо НЕ сирою (raw_date, як записано
+            # в таблиці — "1.1.2001" чи "01.01.2001", будь-як), а
+            # НОРМАЛІЗОВАНОЮ через bdate (уже успішно розпарсений datetime
+            # об'єкт вище) — завжди у форматі ДД.ММ.РРРР з нулями. Це той
+            # самий клас проблеми, що й із "section": якщо HR перезапише
+            # дату в іншому написанні (без нуля замість з нулем, або
+            # навпаки) для ТІЄЇ САМОЇ людини — без нормалізації ключ
+            # змінився б, і бот вважав би її новою.
+            normalized_date = bdate.strftime("%d.%m.%Y")
             identity_location = last_known_city or current_section
-            key = make_person_key(name, raw_date, identity_location)
+            key = make_person_key(name, normalized_date, identity_location)
             result.append({
                 "row": idx,
                 "name": name,
-                "date_str": raw_date,
+                "date_str": normalized_date,
                 "section": current_section,
                 "city": last_known_city,
                 "city_type": last_known_city_type,
